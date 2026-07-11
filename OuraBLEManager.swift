@@ -3,12 +3,11 @@
 //  PulseLoopIOS - Oura Ring Extension
 //
 //  Fetch layer: BLE transport, pairing, authentication, and history/live sync
-//  for Oura Ring (Gen 3/4/5), modeled after the fetch layer of open_oura
-//  (https://github.com/Th0rgal/open_oura, crate: oura-link).
+//  for Oura Ring (Gen 3/4/5), based on open_oura protocol documentation.
+//  (https://github.com/Th0rgal/open_oura)
 //
-//  NOTE: Service/Characteristic UUIDs and exact byte offsets must be filled
-//  in from the open_oura source (oura-link / oura-protocol crates) before
-//  this compiles against a real device. Placeholders are marked TODO.
+//  Service and characteristic UUIDs are from the Oura Ring 3 Horizon BLE protocol.
+//  Reference: docs/horizon-ring3-protocol-cheatsheet.md in open_oura.
 //
 
 import CoreBluetooth
@@ -20,6 +19,7 @@ enum OuraBLEError: Error {
     case authenticationFailed
     case invalidResponse
     case timeout
+    case bluetoothUnavailable
 }
 
 enum OuraSyncState {
@@ -34,13 +34,15 @@ enum OuraSyncState {
 
 final class OuraBLEManager: NSObject, ObservableObject {
 
-    // TODO: Replace with the actual Oura service/characteristic UUIDs
-    // as documented in open_oura's oura-link crate.
+    // Oura Ring 3/4/5 BLE UUIDs (from open_oura protocol cheatsheet)
+    // Reference: https://github.com/Th0rgal/open_oura/docs/horizon-ring3-protocol-cheatsheet.md
     private struct UUIDs {
-        static let ouraService = CBUUID(string: "0000XXXX-0000-1000-8000-00805F9B34FB")
-        static let authCharacteristic = CBUUID(string: "0000XXXX-0000-1000-8000-00805F9B34FB")
-        static let historyCharacteristic = CBUUID(string: "0000XXXX-0000-1000-8000-00805F9B34FB")
-        static let liveDataCharacteristic = CBUUID(string: "0000XXXX-0000-1000-8000-00805F9B34FB")
+        // Main GATT service for Oura Ring
+        static let ouraService = CBUUID(string: "98ed0001-a541-11e4-b6a0-0002a5d5c51b")
+        
+        // Characteristics for bidirectional communication
+        static let readCharacteristic = CBUUID(string: "98ed0003-a541-11e4-b6a0-0002a5d5c51b")    // Notify
+        static let writeCharacteristic = CBUUID(string: "98ed0002-a541-11e4-b6a0-0002a5d5c51b")   // Write
     }
 
     @Published private(set) var state: OuraSyncState = .idle
@@ -48,9 +50,8 @@ final class OuraBLEManager: NSObject, ObservableObject {
 
     private var centralManager: CBCentralManager!
     private var connectedPeripheral: CBPeripheral?
-    private var authCharacteristic: CBCharacteristic?
-    private var historyCharacteristic: CBCharacteristic?
-    private var liveCharacteristic: CBCharacteristic?
+    private var readCharacteristic: CBCharacteristic?
+    private var writeCharacteristic: CBCharacteristic?
 
     private let decoder = OuraProtocolDecoder()
     private let store = OuraStore()
@@ -67,6 +68,10 @@ final class OuraBLEManager: NSObject, ObservableObject {
     }
 
     func startScan() {
+        guard centralManager.state == .poweredOn else {
+            state = .error(.bluetoothUnavailable)
+            return
+        }
         state = .scanning
         centralManager.scanForPeripherals(withServices: [UUIDs.ouraService], options: nil)
     }
@@ -82,20 +87,39 @@ final class OuraBLEManager: NSObject, ObservableObject {
         centralManager.connect(peripheral, options: nil)
     }
 
-    /// Kicks off the App-Auth handshake required before any history event
-    /// can be read from the ring. Mirrors oura-protocol's AES-based
-    /// authentication flow.
+    /// Starts the App-Auth handshake required before history events can be read.
+    /// Protocol: request nonce → encrypt nonce with AES/ECB → authenticate
+    /// Reference: horizon-ring3-protocol-cheatsheet.md, "App Auth" section
     private func startAuthentication() {
         guard let peripheral = connectedPeripheral,
-              let authChar = authCharacteristic else {
+              let writeChar = writeCharacteristic else {
             state = .error(.notConnected)
             return
         }
         state = .authenticating
 
         do {
-            let challengeRequest = try decoder.buildAuthChallengeRequest()
-            peripheral.writeValue(challengeRequest, for: authChar, type: .withResponse)
+            // Step 1: Request nonce (opcode 0x2f, extended tag 0x2b)
+            let nonceRequest = try decoder.buildNonceRequest()
+            peripheral.writeValue(nonceRequest, for: writeChar, type: .withResponse)
+        } catch {
+            state = .error(.authenticationFailed)
+        }
+    }
+
+    private func handleNonceResponse(_ data: Data) {
+        do {
+            // Step 2: Extract nonce, encrypt it, and send auth challenge
+            let nonce = try decoder.extractNonce(from: data)
+            let encryptedChallenge = try decoder.buildAuthChallenge(with: nonce)
+            
+            guard let peripheral = connectedPeripheral,
+                  let writeChar = writeCharacteristic else {
+                state = .error(.notConnected)
+                return
+            }
+            
+            peripheral.writeValue(encryptedChallenge, for: writeChar, type: .withResponse)
         } catch {
             state = .error(.authenticationFailed)
         }
@@ -103,8 +127,8 @@ final class OuraBLEManager: NSObject, ObservableObject {
 
     private func handleAuthResponse(_ data: Data) {
         do {
-            let sessionKey = try decoder.completeAuthHandshake(responseData: data)
-            decoder.setSessionKey(sessionKey)
+            // Step 3: Verify auth success, set decoder session state
+            try decoder.completeAuthentication(responseData: data)
             beginHistorySync()
         } catch {
             state = .error(.authenticationFailed)
@@ -113,12 +137,12 @@ final class OuraBLEManager: NSObject, ObservableObject {
 
     private func beginHistorySync() {
         guard let peripheral = connectedPeripheral,
-              let historyChar = historyCharacteristic else { return }
+              let writeChar = writeCharacteristic else { return }
         state = .syncingHistory
         let cursor = store.lastSyncCursor()
         do {
             let request = try decoder.buildHistoryRequest(sinceCursor: cursor)
-            peripheral.writeValue(request, for: historyChar, type: .withResponse)
+            peripheral.writeValue(request, for: writeChar, type: .withResponse)
         } catch {
             state = .error(.invalidResponse)
         }
@@ -156,7 +180,12 @@ final class OuraBLEManager: NSObject, ObservableObject {
 
 extension OuraBLEManager: CBCentralManagerDelegate {
     func centralManagerDidUpdateState(_ central: CBCentralManager) {
-        // TODO: handle poweredOff / unauthorized states with user-facing errors
+        switch central.state {
+        case .poweredOff, .unsupported, .unauthorized:
+            state = .error(.bluetoothUnavailable)
+        default:
+            break
+        }
     }
 
     func centralManager(_ central: CBCentralManager, didDiscover peripheral: CBPeripheral,
@@ -182,7 +211,7 @@ extension OuraBLEManager: CBPeripheralDelegate {
         guard let services = peripheral.services else { return }
         for service in services where service.uuid == UUIDs.ouraService {
             peripheral.discoverCharacteristics(
-                [UUIDs.authCharacteristic, UUIDs.historyCharacteristic, UUIDs.liveDataCharacteristic],
+                [UUIDs.readCharacteristic, UUIDs.writeCharacteristic],
                 for: service
             )
         }
@@ -192,15 +221,11 @@ extension OuraBLEManager: CBPeripheralDelegate {
         guard let characteristics = service.characteristics else { return }
         for characteristic in characteristics {
             switch characteristic.uuid {
-            case UUIDs.authCharacteristic:
-                authCharacteristic = characteristic
+            case UUIDs.readCharacteristic:
+                readCharacteristic = characteristic
                 peripheral.setNotifyValue(true, for: characteristic)
-            case UUIDs.historyCharacteristic:
-                historyCharacteristic = characteristic
-                peripheral.setNotifyValue(true, for: characteristic)
-            case UUIDs.liveDataCharacteristic:
-                liveCharacteristic = characteristic
-                peripheral.setNotifyValue(true, for: characteristic)
+            case UUIDs.writeCharacteristic:
+                writeCharacteristic = characteristic
             default:
                 break
             }
@@ -211,15 +236,22 @@ extension OuraBLEManager: CBPeripheralDelegate {
     func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
         guard error == nil, let data = characteristic.value else { return }
 
-        switch characteristic.uuid {
-        case UUIDs.authCharacteristic:
-            handleAuthResponse(data)
-        case UUIDs.historyCharacteristic:
-            handleIncomingFrame(data, isLive: false)
-        case UUIDs.liveDataCharacteristic:
-            handleIncomingFrame(data, isLive: true)
-        default:
-            break
+        // BLE frames are tagged; interpret based on extended/basic tag
+        if data.count >= 2 {
+            let tag = data[0]
+            let extTag = data.count >= 2 ? data[1] : UInt8(0)
+            
+            switch (tag, extTag) {
+            case (0x2f, 0x10): // Nonce response (extended tag 0x2f, payload tag 0x10)
+                handleNonceResponse(data)
+            case (0x2f, 0x02): // Auth response (extended tag 0x2f, payload tag 0x02)
+                handleAuthResponse(data)
+            case (0x11, _): // History event summary or frame data
+                handleIncomingFrame(data, isLive: false)
+            default:
+                // Other frames (e.g., live data, status)
+                handleIncomingFrame(data, isLive: true)
+            }
         }
     }
 }
